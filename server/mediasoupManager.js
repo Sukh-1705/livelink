@@ -65,22 +65,26 @@ class MediasoupManager {
   async init() {
     if (this.worker) return;
 
-    this.worker = await mediasoup.createWorker({
-      rtcMinPort: 20000,
-      rtcMaxPort: 29999,
-      logLevel: 'warn',
-      logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp']
-    });
+    try {
+      this.worker = await mediasoup.createWorker({
+        rtcMinPort: 20000,
+        rtcMaxPort: 29999,
+        logLevel: 'warn',
+        logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp']
+      });
 
-    this.worker.on('died', () => {
-      console.error('Mediasoup Worker died! Restarting...');
-      setTimeout(() => {
-        this.worker = null;
-        this.init();
-      }, 2000);
-    });
+      this.worker.on('died', () => {
+        console.error('Mediasoup Worker died! Restarting...');
+        setTimeout(() => {
+          this.worker = null;
+          this.init();
+        }, 2000);
+      });
 
-    console.log(`[Mediasoup] C++ Worker initialized (PID: ${this.worker.pid})`);
+      console.log(`[Mediasoup] C++ Worker initialized (PID: ${this.worker.pid})`);
+    } catch (err) {
+      console.warn('[Mediasoup] Worker init failed in this cloud environment, continuing with Direct P2P WebRTC:', err.message);
+    }
   }
 
   async getOrCreateRoom(roomId) {
