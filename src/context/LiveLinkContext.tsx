@@ -1,5 +1,4 @@
 import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
-import * as mediasoupClient from 'mediasoup-client';
 import { CameraStream, TallyState, CueMessage, RemoteControlPayload, ServerInfo } from '../types';
 import { AudioMixerNode } from '../utils/audio';
 import { mungeSdp, tuneReceiverJitterBuffer, collectStreamStats, applySenderEncodingParameters } from '../utils/webrtc';
@@ -59,9 +58,9 @@ export const LiveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const senderSettingsRef = useRef<any>(null);
   const isBroadcastingRef = useRef<boolean>(false);
   const p2pSenderConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const mediasoupDeviceRef = useRef<mediasoupClient.Device | null>(null);
-  const recvTransportRef = useRef<mediasoupClient.types.Transport | null>(null);
-  const sendTransportRef = useRef<mediasoupClient.types.Transport | null>(null);
+  const mediasoupDeviceRef = useRef<any>(null);
+  const recvTransportRef = useRef<any>(null);
+  const sendTransportRef = useRef<any>(null);
   const audioMixersRef = useRef<Map<string, AudioMixerNode>>(new Map());
   const statsIntervalRef = useRef<any>(null);
   const iceCandidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
@@ -212,108 +211,11 @@ export const LiveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         break;
       }
 
-      case 'rtp-capabilities': {
-        try {
-          const device = new mediasoupClient.Device();
-          await device.load({ routerRtpCapabilities: msg.rtpCapabilities });
-          mediasoupDeviceRef.current = device;
-
-          // Request receive transport
-          wsSend({
-            type: 'create-transport',
-            roomId,
-            peerId,
-            direction: 'recv'
-          });
-        } catch (err) {
-          console.error('[Mediasoup] Error loading router capabilities:', err);
-        }
+      case 'rtp-capabilities':
+      case 'transport-created':
+      case 'new-producer':
+      case 'consumed':
         break;
-      }
-
-      case 'transport-created': {
-        const { direction, transportParams } = msg;
-        const device = mediasoupDeviceRef.current;
-        if (!device) return;
-
-        if (direction === 'recv') {
-          const transport = device.createRecvTransport(transportParams);
-          recvTransportRef.current = transport;
-
-          transport.on('connect', ({ dtlsParameters }, callback, errback) => {
-            wsSend({
-              type: 'connect-transport',
-              roomId,
-              transportId: transport.id,
-              dtlsParameters
-            });
-            // Acknowledge locally
-            callback();
-          });
-
-          // Transport ready! If there are existing producers, consume them
-          wsSend({ type: 'get-producers', roomId });
-        }
-        break;
-      }
-
-      case 'new-producer': {
-        // If receiver, consume the producer
-        if (role === 'receiver' || role === 'viewer') {
-          const device = mediasoupDeviceRef.current;
-          const recvTransport = recvTransportRef.current;
-          if (!device || !recvTransport) return;
-
-          wsSend({
-            type: 'consume',
-            roomId,
-            transportId: recvTransport.id,
-            producerId: msg.producerId,
-            rtpCapabilities: device.rtpCapabilities
-          });
-        }
-        break;
-      }
-
-      case 'consumed': {
-        const { consumerParams } = msg;
-        const recvTransport = recvTransportRef.current;
-        if (!recvTransport) return;
-
-        const consumer = await recvTransport.consume(consumerParams);
-        const { track, kind } = consumer;
-        const streamId = consumerParams.appData?.streamId || consumerParams.producerId;
-        const label = consumerParams.appData?.label || `Camera ${streamId.substring(0, 4)}`;
-
-        setCameraStreams(prev => {
-          const existing = prev.find(s => s.id === streamId);
-          if (existing) {
-            existing.mediaStream.addTrack(track);
-            return [...prev];
-          } else {
-            const newStream = new MediaStream([track]);
-            const mixer = new AudioMixerNode();
-            const mixedStream = mixer.attachStream(newStream);
-            audioMixersRef.current.set(streamId, mixer);
-
-            return [
-              ...prev,
-              {
-                id: streamId,
-                peerId: consumerParams.appData?.peerId || '',
-                label,
-                mediaStream: mixedStream,
-                tally: 'standby',
-                audioVolume: 1.0,
-                isMuted: false,
-                isSolo: false,
-                audioDelayMs: 0
-              }
-            ];
-          }
-        });
-        break;
-      }
 
       // --- Direct P2P & Stream Distribution ---
       case 'sender-joined': {

@@ -27,8 +27,6 @@
     "framer-motion": "^14.7.1",
     "localtunnel": "^2.0.2",
     "lucide-react": "^1.62.0",
-    "mediasoup": "^3.32.0",
-    "mediasoup-client": "^3.25.3",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "react": "^19.3.1",
