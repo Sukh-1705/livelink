@@ -68,6 +68,16 @@ async function startServer() {
     });
   });
 
+  // Health check endpoint for UptimeRobot / keep-alive pings
+  app.get(['/health', '/api/health'], (req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      service: 'LiveLink',
+      uptimeSeconds: Math.floor(process.uptime()),
+      timestamp: Date.now()
+    });
+  });
+
   app.get('/api/cert', (req, res) => {
     res.setHeader('Content-Type', 'application/x-x509-ca-cert');
     res.setHeader('Content-Disposition', 'attachment; filename="livelink-lan-cert.pem"');
@@ -77,7 +87,7 @@ async function startServer() {
   // Client-side routes (SPA fallback)
   app.use((req, res, next) => {
     // If it's an API route or file that wasn't found, let it 404
-    if (req.path.startsWith('/api') || req.path.startsWith('/ws')) {
+    if (req.path.startsWith('/api') || req.path.startsWith('/ws') || req.path.startsWith('/health')) {
       return next();
     }
     const indexPath = path.join(distPath, 'index.html');
