@@ -7,7 +7,7 @@ import { TallyBadge } from '../components/TallyBadge';
 import { CueOverlay } from '../components/CueOverlay';
 import { createSyntheticStream } from '../utils/syntheticStream';
 import { getProductionAudioConstraints } from '../utils/audio';
-import { applySenderEncodingParameters, mungeSdp, collectStreamStats } from '../utils/webrtc';
+import { applySenderEncodingParameters, mungeSdp, collectStreamStats, createStrictCanvasStream } from '../utils/webrtc';
 import clsx from 'clsx';
 
 export const SenderView: React.FC = () => {
@@ -48,19 +48,30 @@ export const SenderView: React.FC = () => {
   const [settings, setSettings] = useState<SenderSettings>(() => {
     const saved = localStorage.getItem('livelink_sender_settings');
     if (saved) {
-      try { return JSON.parse(saved); } catch (e) {}
+      try {
+        const parsed = JSON.parse(saved);
+        return {
+          ...parsed,
+          // Guarantee strict quality if previously corrupted or defaulting to downscaling
+          degradationPreference: parsed.degradationPreference === 'maintain-framerate' ? 'disabled' : (parsed.degradationPreference || 'disabled'),
+          strictQualityLock: parsed.strictQualityLock !== false,
+          forceCanvasOutput: parsed.forceCanvasOutput ?? true
+        };
+      } catch (e) {}
     }
     return {
       sourceType: 'camera',
       deviceId: '',
       audioDeviceId: '',
-      resolution: '1080p',
+      resolution: '1440p',
       frameRate: 60,
-      bitrateKbps: 30000, // 30 Mbps LAN default
+      bitrateKbps: 40000, // 40 Mbps for crisp 1440p60
       codec: 'h264',
-      degradationPreference: 'maintain-framerate',
+      degradationPreference: 'disabled',
       latencyMode: 'ultra-low',
-      contentHint: 'motion',
+      contentHint: 'detail',
+      strictQualityLock: true,
+      forceCanvasOutput: true,
       stereo: true,
       echoCancellation: false,
       noiseSuppression: false,
@@ -78,6 +89,7 @@ export const SenderView: React.FC = () => {
   const videoPreviewRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const syntheticStopRef = useRef<(() => void) | null>(null);
+  const canvasStopRef = useRef<(() => void) | null>(null);
   const rtpSenderRef = useRef<RTCRtpSender | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const wakeLockRef = useRef<any>(null);
@@ -141,38 +153,59 @@ export const SenderView: React.FC = () => {
       syntheticStopRef.current();
       syntheticStopRef.current = null;
     }
+    if (canvasStopRef.current) {
+      canvasStopRef.current();
+      canvasStopRef.current = null;
+    }
 
     try {
       let stream: MediaStream;
 
+      const resMap: Record<ResolutionPreset, { width: number; height: number }> = {
+        '4k': { width: 3840, height: 2160 },
+        '1440p': { width: 2560, height: 1440 },
+        '1080p': { width: 1920, height: 1080 },
+        '720p': { width: 1280, height: 720 },
+        '480p': { width: 854, height: 480 },
+        'custom': { width: settings.customWidth || 1920, height: settings.customHeight || 1080 }
+      };
+      const targetRes = resMap[settings.resolution] || resMap['1440p'];
+
       if (settings.sourceType === 'synthetic') {
         const { stream: synthStream, stop } = createSyntheticStream(
           settings.sourceLabel,
-          settings.resolution === '4k' ? 3840 : settings.resolution === '1440p' ? 2560 : 1920,
-          settings.resolution === '4k' ? 2160 : settings.resolution === '1440p' ? 1440 : 1080,
+          targetRes.width,
+          targetRes.height,
           settings.frameRate
         );
         syntheticStopRef.current = stop;
         stream = synthStream;
       } else if (settings.sourceType === 'screen') {
-        stream = await navigator.mediaDevices.getDisplayMedia({
+        const displayConstraints: any = {
           video: {
+            width: { ideal: targetRes.width, max: targetRes.width },
+            height: { ideal: targetRes.height, max: targetRes.height },
             frameRate: { ideal: settings.frameRate, max: settings.frameRate }
           },
           audio: settings.stereo ? { echoCancellation: false, noiseSuppression: false } : true
-        });
-      } else {
-        // Camera / Capture Card / Virtual Camera
-        const resMap: Record<ResolutionPreset, { width: number; height: number }> = {
-          '4k': { width: 3840, height: 2160 },
-          '1440p': { width: 2560, height: 1440 },
-          '1080p': { width: 1920, height: 1080 },
-          '720p': { width: 1280, height: 720 },
-          '480p': { width: 854, height: 480 },
-          'custom': { width: settings.customWidth || 1920, height: settings.customHeight || 1080 }
         };
 
-        const targetRes = resMap[settings.resolution] || resMap['1080p'];
+        const rawStream = await navigator.mediaDevices.getDisplayMedia(displayConstraints);
+
+        if (settings.forceCanvasOutput) {
+          const { stream: canvasStream, stop: canvasStop } = createStrictCanvasStream(
+            rawStream,
+            targetRes.width,
+            targetRes.height,
+            settings.frameRate
+          );
+          canvasStopRef.current = canvasStop;
+          stream = canvasStream;
+        } else {
+          stream = rawStream;
+        }
+      } else {
+        // Camera / Capture Card / Virtual Camera
         const videoConstraints: MediaTrackConstraints = {
           deviceId: settings.deviceId ? { ideal: settings.deviceId } : undefined,
           width: { ideal: targetRes.width },
@@ -208,10 +241,10 @@ export const SenderView: React.FC = () => {
         }
       }
 
-      // Apply contentHint ('motion' disables spatial downscaling in WebRTC)
+      // Apply contentHint ('detail' preserves crisp resolution, 'motion' is for camera motion)
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
-        (videoTrack as any).contentHint = settings.contentHint;
+        (videoTrack as any).contentHint = settings.contentHint || (settings.sourceType === 'screen' ? 'detail' : 'motion');
       }
 
       localStreamRef.current = stream;
@@ -246,6 +279,10 @@ export const SenderView: React.FC = () => {
       if (syntheticStopRef.current) {
         syntheticStopRef.current();
         syntheticStopRef.current = null;
+      }
+      if (canvasStopRef.current) {
+        canvasStopRef.current();
+        canvasStopRef.current = null;
       }
     };
   }, []);
@@ -578,7 +615,22 @@ export const SenderView: React.FC = () => {
                   {(['720p', '1080p', '1440p', '4k'] as ResolutionPreset[]).map(res => (
                     <button
                       key={res}
-                      onClick={() => setSettings(s => ({ ...s, resolution: res }))}
+                      onClick={() => {
+                        const presetMap: Record<string, number> = {
+                          '720p': 12000,
+                          '1080p': 25000,
+                          '1440p': 40000,
+                          '4k': 60000
+                        };
+                        setSettings(s => ({
+                          ...s,
+                          resolution: res,
+                          bitrateKbps: presetMap[res] || 30000,
+                          frameRate: 60,
+                          degradationPreference: 'disabled',
+                          strictQualityLock: true
+                        }));
+                      }}
                       className={clsx(
                         'py-2 rounded-lg text-xs font-bold border transition-all',
                         settings.resolution === res
@@ -632,15 +684,52 @@ export const SenderView: React.FC = () => {
                 />
                 <div className="flex justify-between text-[10px] text-zinc-500">
                   <span>Balanced (15M)</span>
-                  <span>1080p60 HQ (30M)</span>
-                  <span>LAN Max (50M+)</span>
+                  <span>1080p60 HQ (25M)</span>
+                  <span>1440p60 Strict (40M+)</span>
                 </div>
               </div>
 
-              {/* Audio & Degradation Preferences */}
-              <div className="p-3 bg-zinc-950 rounded-xl border border-zinc-800 space-y-2 text-xs">
+              {/* Quality & Audio Strict Locks */}
+              <div className="p-3.5 bg-zinc-950 rounded-xl border border-zinc-800 space-y-3 text-xs">
+                {/* Strict Quality Lock */}
                 <div className="flex items-center justify-between">
-                  <span className="text-zinc-300">Clean Camera Audio (No AEC/AGC):</span>
+                  <div>
+                    <span className="text-zinc-200 font-semibold block">Strict Quality Lock (Zero Fluctuation)</span>
+                    <span className="text-[10px] text-zinc-400 block">Disables WebRTC downscaling & locks high bitrate floor</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={settings.degradationPreference === 'disabled' || settings.strictQualityLock !== false}
+                    onChange={(e) => setSettings(s => ({
+                      ...s,
+                      strictQualityLock: e.target.checked,
+                      degradationPreference: e.target.checked ? 'disabled' : 'balanced'
+                    }))}
+                    className="accent-red-500 w-4 h-4 cursor-pointer"
+                  />
+                </div>
+
+                {/* Force Canvas Output Lock (for Screen/Window Share) */}
+                {settings.sourceType === 'screen' && (
+                  <div className="flex items-center justify-between pt-2 border-t border-zinc-800/80">
+                    <div>
+                      <span className="text-zinc-200 font-semibold block">Force 1440p Canvas Lock (2560x1440)</span>
+                      <span className="text-[10px] text-zinc-400 block">Guarantees exact 2560x1440 @ 60fps even for resized/tiled windows</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={settings.forceCanvasOutput !== false}
+                      onChange={(e) => setSettings(s => ({
+                        ...s,
+                        forceCanvasOutput: e.target.checked
+                      }))}
+                      className="accent-red-500 w-4 h-4 cursor-pointer"
+                    />
+                  </div>
+                )}
+
+                <div className="flex items-center justify-between pt-2 border-t border-zinc-800/80">
+                  <span className="text-zinc-300">Clean Camera Audio (No Echo/Noise Gate):</span>
                   <input
                     type="checkbox"
                     checked={!settings.echoCancellation}
@@ -652,19 +741,17 @@ export const SenderView: React.FC = () => {
                     className="accent-red-500 cursor-pointer"
                   />
                 </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-zinc-300">Degradation: Maintain Frame Rate:</span>
-                  <input
-                    type="checkbox"
-                    checked={settings.degradationPreference === 'maintain-framerate'}
-                    onChange={(e) => setSettings(s => ({
-                      ...s,
-                      degradationPreference: e.target.checked ? 'maintain-framerate' : 'maintain-resolution'
-                    }))}
-                    className="accent-red-500 cursor-pointer"
-                  />
-                </div>
               </div>
+
+              {/* Informative Screen Share Tip */}
+              {settings.sourceType === 'screen' && (
+                <div className="p-2.5 rounded-lg bg-zinc-900/60 border border-zinc-800 text-[11px] text-zinc-400 flex items-start gap-2">
+                  <span className="text-amber-400 font-bold">💡 Tip:</span>
+                  <span>
+                    When the browser asks what to share, choose <strong>Entire Screen</strong> for native 1440p/4K. If sharing an individual window, <strong>Canvas Lock</strong> automatically formats it into crisp 2560x1440.
+                  </span>
+                </div>
+              )}
             </div>
 
             {/* Go Live Button & Broadcast Links */}

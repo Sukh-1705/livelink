@@ -1,35 +1,69 @@
 import { SenderSettings, LatencyMode } from '../types';
 
 /**
- * Custom SDP munger to enforce LAN Max bitrates, prevent WebRTC GCC downscaling,
- * and force high-quality stereo Opus.
+ * Custom SDP munger to enforce LAN/Cloud Max bitrates, prevent WebRTC GCC downscaling,
+ * lock x-google min/start/max bitrates, and force high-quality stereo Opus.
  */
 export function mungeSdp(sdp: string, bitrateKbps: number, stereo = true): string {
   let lines = sdp.split('\r\n');
   let inAudioSection = false;
+  let inVideoSection = false;
+
+  const maxBitrate = Math.max(25000, bitrateKbps);
+  // Strict floor at 75% of maxBitrate stops Google Congestion Control from collapsing bitrate
+  const minBitrate = Math.round(maxBitrate * 0.75);
+  const startBitrate = Math.round(maxBitrate * 0.9);
+
+  const newLines: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+    let line = lines[i];
 
     if (line.startsWith('m=audio')) {
       inAudioSection = true;
+      inVideoSection = false;
+    } else if (line.startsWith('m=video')) {
+      inAudioSection = false;
+      inVideoSection = true;
     } else if (line.startsWith('m=')) {
       inAudioSection = false;
+      inVideoSection = false;
+    }
+
+    // Skip any existing bandwidth lines under video so we can inject strict directives
+    if (inVideoSection && (line.startsWith('b=AS:') || line.startsWith('b=TIAS:'))) {
+      continue;
     }
 
     // Set high-bitrate stereo Opus parameters
     if (inAudioSection && line.startsWith('a=fmtp:') && line.includes('opus')) {
       if (stereo && !line.includes('stereo=1')) {
-        lines[i] = `${line};stereo=1;sprop-stereo=1;maxaveragebitrate=256000;cbr=1`;
+        line = `${line};stereo=1;sprop-stereo=1;maxaveragebitrate=256000;cbr=1`;
       }
+    }
+
+    // Video codec format lines: inject strict min/start/max bitrates to avoid GCC downscaling
+    if (inVideoSection && line.startsWith('a=fmtp:')) {
+      if (!line.includes('x-google-min-bitrate')) {
+        line = `${line};x-google-min-bitrate=${minBitrate};x-google-max-bitrate=${maxBitrate};x-google-start-bitrate=${startBitrate}`;
+      }
+    }
+
+    newLines.push(line);
+
+    // Immediately after m=video, inject b=AS (kbps) and b=TIAS (bps)
+    if (line.startsWith('m=video')) {
+      newLines.push(`b=AS:${maxBitrate}`);
+      newLines.push(`b=TIAS:${maxBitrate * 1000}`);
     }
   }
 
-  return lines.join('\r\n');
+  return newLines.join('\r\n');
 }
 
 /**
  * Applies strict encoding parameters to the video sender without renegotiating SDP.
+ * Uses 'disabled' degradationPreference to turn off WebRTC quality downscaling entirely.
  */
 export async function applySenderEncodingParameters(
   sender: RTCRtpSender,
@@ -41,24 +75,132 @@ export async function applySenderEncodingParameters(
       params.encodings = [{}];
     }
 
-    const maxBps = Math.max(2500000, settings.bitrateKbps * 1000);
+    const maxBps = Math.max(5000000, (settings.bitrateKbps || 30000) * 1000);
+    const minBps = Math.round(maxBps * 0.75);
 
-    params.encodings[0].maxBitrate = maxBps;
-    params.encodings[0].maxFramerate = settings.frameRate;
-    params.encodings[0].scaleResolutionDownBy = 1.0;
-    (params.encodings[0] as any).priority = 'high';
-    (params.encodings[0] as any).networkPriority = 'high';
-
-    // Apply degradation preference
-    if ('degradationPreference' in sender) {
-      (sender as any).degradationPreference = settings.degradationPreference;
+    for (let i = 0; i < params.encodings.length; i++) {
+      params.encodings[i].maxBitrate = maxBps;
+      params.encodings[i].minBitrate = minBps;
+      params.encodings[i].maxFramerate = settings.frameRate || 60;
+      params.encodings[i].scaleResolutionDownBy = 1.0;
+      (params.encodings[i] as any).priority = 'high';
+      (params.encodings[i] as any).networkPriority = 'high';
     }
 
-    await sender.setParameters(params);
-    console.log(`[WebRTC] Applied encoding parameters: ${settings.bitrateKbps} kbps max, ${settings.frameRate} fps, ${settings.degradationPreference}`);
+    // W3C degradationPreference on RTCRtpSendParameters:
+    // 'disabled': completely shuts off WebRTC QualityScaler (zero downscaling, zero framerate degradation)
+    // Fallback to 'maintain-resolution' if older browser engine rejects 'disabled'
+    const targetPref = settings.degradationPreference || (settings.strictQualityLock !== false ? 'disabled' : 'maintain-resolution');
+    (params as any).degradationPreference = targetPref;
+
+    if ('degradationPreference' in sender) {
+      try { (sender as any).degradationPreference = targetPref; } catch (_) {}
+    }
+
+    try {
+      await sender.setParameters(params);
+      console.log(`[WebRTC] Applied strict parameters: ${settings.bitrateKbps} kbps max, ${settings.frameRate} fps, degradationPreference: ${targetPref}`);
+    } catch (prefErr) {
+      console.warn(`[WebRTC] setParameters with preference '${targetPref}' failed, trying 'maintain-resolution':`, prefErr);
+      (params as any).degradationPreference = 'maintain-resolution';
+      await sender.setParameters(params);
+    }
   } catch (err) {
     console.warn('[WebRTC] Failed to set sender parameters:', err);
   }
+}
+
+/**
+ * Scales and locks any source stream (even half-screen/arbitrary window sizes)
+ * into an exact target resolution (e.g. 2560x1440 @ 60fps) with aspect-ratio preservation.
+ */
+export function createStrictCanvasStream(
+  sourceStream: MediaStream,
+  targetWidth: number,
+  targetHeight: number,
+  targetFps: number = 60
+): { stream: MediaStream; stop: () => void } {
+  const videoTrack = sourceStream.getVideoTracks()[0];
+  if (!videoTrack) {
+    return { stream: sourceStream, stop: () => {} };
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+  const tempVideo = document.createElement('video');
+  tempVideo.autoplay = true;
+  tempVideo.muted = true;
+  tempVideo.playsInline = true;
+  tempVideo.srcObject = new MediaStream([videoTrack]);
+  tempVideo.play().catch(() => {});
+
+  let animFrameId: number;
+  let isRunning = true;
+
+  const render = () => {
+    if (!isRunning) return;
+    if (ctx && tempVideo.readyState >= 2) {
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+
+      const srcW = tempVideo.videoWidth || targetWidth;
+      const srcH = tempVideo.videoHeight || targetHeight;
+      const srcRatio = srcW / srcH;
+      const targetRatio = targetWidth / targetHeight;
+
+      let drawW = targetWidth;
+      let drawH = targetHeight;
+      let drawX = 0;
+      let drawY = 0;
+
+      if (srcRatio > targetRatio) {
+        drawW = targetWidth;
+        drawH = targetWidth / srcRatio;
+        drawY = (targetHeight - drawH) / 2;
+      } else {
+        drawH = targetHeight;
+        drawW = targetHeight * srcRatio;
+        drawX = (targetWidth - drawW) / 2;
+      }
+
+      ctx.fillStyle = '#09090b';
+      ctx.fillRect(0, 0, targetWidth, targetHeight);
+      ctx.drawImage(tempVideo, drawX, drawY, drawW, drawH);
+    }
+
+    if ('requestVideoFrameCallback' in tempVideo) {
+      (tempVideo as any).requestVideoFrameCallback(render);
+    } else {
+      animFrameId = requestAnimationFrame(render);
+    }
+  };
+
+  if ('requestVideoFrameCallback' in tempVideo) {
+    (tempVideo as any).requestVideoFrameCallback(render);
+  } else {
+    animFrameId = requestAnimationFrame(render);
+  }
+
+  const canvasStream = canvas.captureStream(targetFps);
+  const outVideoTrack = canvasStream.getVideoTracks()[0];
+  if (outVideoTrack) {
+    (outVideoTrack as any).contentHint = 'detail';
+  }
+
+  sourceStream.getAudioTracks().forEach(a => canvasStream.addTrack(a));
+
+  const stop = () => {
+    isRunning = false;
+    cancelAnimationFrame(animFrameId);
+    tempVideo.pause();
+    tempVideo.srcObject = null;
+    canvasStream.getTracks().forEach(t => t.stop());
+  };
+
+  return { stream: canvasStream, stop };
 }
 
 /**

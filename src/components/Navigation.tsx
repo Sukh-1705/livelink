@@ -70,17 +70,15 @@ export const Navigation: React.FC<NavigationProps> = ({ currentView = 'receiver'
             <span className="font-bold text-white">{roomId}</span>
           </div>
 
-          {/* SFU vs P2P Mode Switcher */}
-          <button
-            onClick={toggleMode}
-            title="Click to toggle Media Routing mode"
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-xs text-zinc-300 transition-colors"
+          {/* WebRTC Routing Badge */}
+          <div
+            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-900 border border-zinc-800 text-xs text-zinc-300"
           >
             <span className="text-zinc-500">ROUTING:</span>
-            <span className={clsx('font-bold', mode === 'sfu' ? 'text-cyan-400' : 'text-purple-400')}>
-              {mode === 'sfu' ? 'Mediasoup SFU' : 'Direct P2P'}
+            <span className="font-bold text-emerald-400">
+              Direct WebRTC (P2P 60fps)
             </span>
-          </button>
+          </div>
         </div>
 
         {/* Center: View Switcher Tabs */}

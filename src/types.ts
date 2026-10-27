@@ -4,7 +4,7 @@ export type ResolutionPreset = '4k' | '1440p' | '1080p' | '720p' | '480p' | 'cus
 
 export type CodecType = 'h264' | 'vp9' | 'av1' | 'vp8';
 
-export type DegradationPreference = 'maintain-framerate' | 'maintain-resolution' | 'balanced';
+export type DegradationPreference = 'disabled' | 'maintain-resolution' | 'maintain-framerate' | 'balanced';
 
 export type LatencyMode = 'ultra-low' | 'smooth';
 
@@ -23,6 +23,8 @@ export interface SenderSettings {
   degradationPreference: DegradationPreference;
   latencyMode: LatencyMode;
   contentHint: 'motion' | 'detail';
+  strictQualityLock?: boolean;
+  forceCanvasOutput?: boolean;
   stereo: boolean;
   echoCancellation: boolean;
   noiseSuppression: boolean;

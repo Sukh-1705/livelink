@@ -45,7 +45,7 @@ export const LiveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [roomId, setRoomId] = useState('studio');
   const [peerId] = useState(() => 'peer_' + Math.random().toString(36).substring(2, 9));
   const [role, setRole] = useState<'sender' | 'receiver' | 'viewer'>('receiver');
-  const [mode, setMode] = useState<'sfu' | 'p2p'>('sfu');
+  const [mode, setMode] = useState<'sfu' | 'p2p'>('p2p');
   const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
   const [cameraStreams, setCameraStreams] = useState<CameraStream[]>([]);
   const [programStreamId, setProgramStreamId] = useState<string | null>(null);
@@ -158,7 +158,8 @@ export const LiveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         offerToReceiveAudio: false,
         offerToReceiveVideo: false
       });
-      const mungedSdp = mungeSdp(offer.sdp, settings?.bitrateKbps || 30000, settings?.stereo ?? true);
+      const targetBitrate = settings?.bitrateKbps || 40000;
+      const mungedSdp = mungeSdp(offer.sdp, targetBitrate, settings?.stereo ?? true);
       await pc.setLocalDescription(new RTCSessionDescription({ type: 'offer', sdp: mungedSdp }));
 
       wsSend({
@@ -168,6 +169,7 @@ export const LiveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         senderPeerId: peerIdRef.current,
         targetPeerId: receiverPeerId,
         label: settings?.sourceLabel || 'Camera',
+        bitrateKbps: targetBitrate,
         sdp: pc.localDescription
       });
       console.log(`[WebRTC Sender] Dispatched offer to receiver: ${receiverPeerId}`);
@@ -342,7 +344,8 @@ export const LiveLinkProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           }
 
           const answer = await pc.createAnswer();
-          const mungedAnswer = mungeSdp(answer.sdp, 30000, true);
+          const targetBitrate = msg.bitrateKbps || 40000;
+          const mungedAnswer = mungeSdp(answer.sdp, targetBitrate, true);
           await pc.setLocalDescription(new RTCSessionDescription({ type: 'answer', sdp: mungedAnswer }));
           wsSend({
             type: 'answer',
